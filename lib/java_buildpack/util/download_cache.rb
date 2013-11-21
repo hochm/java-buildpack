@@ -28,7 +28,7 @@ module JavaBuildpack::Util
 
   # A cache for downloaded files that is configured to use a filesystem as the backing store. This cache uses standard
   # file locking (<tt>File.flock()</tt>) in order ensure that mutation of files in the cache is non-concurrent across
-  # processes.  Reading files (once they've been downloaded) happens concurrently so read performance is not impacted.
+  # processes.  Reading downloaded files happens concurrently so read performance is not impacted.
   #
   # References:
   # * {https://en.wikipedia.org/wiki/HTTP_ETag ETag Wikipedia Definition}
@@ -43,19 +43,14 @@ module JavaBuildpack::Util
       @logger = JavaBuildpack::Diagnostics::LoggerFactory.get_logger
     end
 
-    # Retrieves an item from the cache.  Retrieval of the item uses the following algorithm:
+    # Retrieves an item from the cache. The algorithm is as follows:
     #
-    # 1. Obtain an exclusive lock based on the URI of the item. This allows concurrency for different items, but not for
-    #    the same item.
-    # 2. If the the cached item does not exist, download from +uri+ and cache it, its +Etag+, and its +Last-Modified+
-    #    values if they exist.
-    # 3. If the cached file does exist, and the original download had an +Etag+ or a +Last-Modified+ value, attempt to
-    #    download from +uri+ again.  If the result is +304+ (+Not-Modified+), then proceed without changing the cached
-    #    item.  If it is anything else, overwrite the cached file and its +Etag+ and +Last-Modified+ values if they exist.
-    # 4. Downgrade the lock to a shared lock as no further mutation of the cache is possible.  This allows concurrency for
-    #    read access of the item.
-    # 5. Yield the cached file (opened read-only) to the passed in block. Once the block is complete, the file is closed
-    #    and the lock is released.
+    # 1. Attempt to retrieve the item from the cache under a shared lock. This includes issuing a HTTP GET request
+    #    to see if the item is up to date. If the item was up to date in the cache, it is yielded. If the item was
+    #    not present in the cache and was not downloaded, an exception is raised.
+    # 2. If the item was not retrieved or was not up to date, obtain an up to date copy under an exclusive lock and
+    #    store it in the cache. If this fails, raise an exception.
+    # 3. Repeat the process until a file is successfully yielded or an exception is raised.
     #
     # @param [String] uri the uri to download if the item is not already in the cache.  Also used in the case where the
     #                     item is already in the cache, to validate that the item is up to date
@@ -65,21 +60,20 @@ module JavaBuildpack::Util
     def get(uri)
       file_cache = FileCache.new(@cache_root, uri)
 
-      file_cache.lock do |locked_file_cache|
-        internet_up, file_downloaded = DownloadCache.internet_available?(locked_file_cache, uri, @logger)
-
-        unless file_downloaded
-          if internet_up && should_update(locked_file_cache)
-            update(locked_file_cache, uri)
-          elsif should_download(locked_file_cache)
-            download(locked_file_cache, uri, internet_up)
+      success = false;
+      until success
+        success = file_cache.lock_shared do |immutable_file_cache|
+          deliver(uri, immutable_file_cache) do |file_data|
+            yield file_data
           end
         end
-        locked_file_cache.data do |file_data|
-          yield file_data
+
+        unless success
+          file_cache.lock_exclusive do |mutable_file_cache|
+            download(uri, mutable_file_cache)
+          end
         end
       end
-
     end
 
     # Remove an item from the cache
@@ -93,6 +87,16 @@ module JavaBuildpack::Util
     private
 
     CACHE_CONFIG = '../../../config/cache.yml'.freeze
+
+    INTERNET_DETECTION_RETRY_LIMIT = 5
+
+    DOWNLOAD_RETRY_LIMIT = 5
+
+    TIMEOUT_SECONDS = 10
+
+    HTTP_OK = '200'.freeze
+
+    HTTP_NOT_MODIFIED = '304'.freeze
 
     HTTP_ERRORS = [
         EOFError,
@@ -116,54 +120,90 @@ module JavaBuildpack::Util
         Timeout::Error
     ].freeze
 
-    HTTP_OK = '200'.freeze
-
-    TIMEOUT_SECONDS = 10
-
-    INTERNET_DETECTION_RETRY_LIMIT = 5
-
-    DOWNLOAD_RETRY_LIMIT = 5
-
     @@monitor = Monitor.new
     @@internet_checked = false
     @@internet_up = true
+
+    def deliver(uri, immutable_file_cache)
+      success = false
+      if immutable_file_cache.cached? && !immutable_file_cache.has_etag? && !immutable_file_cache.has_last_modified?
+        success = true
+      elsif DownloadCache.use_internet?
+
+        request = Net::HTTP::Head.new(uri)
+        add_headers(request, immutable_file_cache)
+        options = DownloadCache.http_options uri
+        retry_limit = DownloadCache.retry_limit
+
+        DownloadCache.issue_http_request(request, uri, retry_limit, @logger, options) do |response|
+          if response.code == HTTP_NOT_MODIFIED
+            success = true
+          end
+        end
+      end
+      if success
+        immutable_file_cache.data do |file_data|
+          yield file_data
+        end
+      end
+      success
+    end
+
+    def add_headers(request, immutable_file_cache)
+      immutable_file_cache.any_etag do |etag_content|
+        request['If-None-Match'] = etag_content
+      end
+
+      immutable_file_cache.any_last_modified do |last_modified_content|
+        request['If-Modified-Since'] = last_modified_content
+      end
+    end
+
+    def self.retry_limit
+      @@monitor.synchronize do
+        @@internet_checked ? DOWNLOAD_RETRY_LIMIT : INTERNET_DETECTION_RETRY_LIMIT
+      end
+    end
+
+    def self.use_internet?
+      @@monitor.synchronize do
+        if !@@internet_checked
+          remote_downloads_configuration = get_configuration['remote_downloads']
+          if remote_downloads_configuration == 'disabled'
+            store_internet_availability false
+            false
+          elsif remote_downloads_configuration == 'enabled'
+            true
+          else
+            fail "Invalid remote_downloads configuration: #{remote_downloads_configuration}"
+          end
+        else
+          @@internet_up
+        end
+      end
+    end
 
     def self.get_configuration
       expanded_path = File.expand_path(CACHE_CONFIG, File.dirname(__FILE__))
       YAML.load_file(expanded_path)
     end
 
-    def self.internet_available?(file_cache, uri, logger)
+    def self.http_options(uri)
+      options = {}
       @@monitor.synchronize do
-        return @@internet_up, false if @@internet_checked # rubocop:disable RedundantReturn
+        options = { read_timeout: TIMEOUT_SECONDS, connect_timeout: TIMEOUT_SECONDS, open_timeout: TIMEOUT_SECONDS } unless @@internet_checked
       end
-      cache_configuration = get_configuration
-      if cache_configuration['remote_downloads'] == 'disabled'
-        return store_internet_availability(false), false # rubocop:disable RedundantReturn
-      elsif cache_configuration['remote_downloads'] == 'enabled'
-        begin
-          # Beware known problems with timeouts: https://www.ruby-forum.com/topic/143840
-          opts = { read_timeout: TIMEOUT_SECONDS, connect_timeout: TIMEOUT_SECONDS, open_timeout: TIMEOUT_SECONDS }
-          return http_get(uri, INTERNET_DETECTION_RETRY_LIMIT, logger, opts) do |response|
-            internet_up = response.code == HTTP_OK
-            write_response(file_cache, response) if internet_up
-            return store_internet_availability(internet_up), internet_up # rubocop:disable RedundantReturn
-          end
-        rescue *HTTP_ERRORS => ex
-          logger.debug { "Internet detection failed with #{ex}" }
-          return store_internet_availability(false), false # rubocop:disable RedundantReturn
-        end
-      else
-        fail "Invalid remote_downloads property in cache configuration: #{cache_configuration}"
-      end
+      options.merge(use_ssl: use_ssl?(URI(uri)))
     end
 
-    def self.http_get(uri, retry_limit, logger, opts = {}, &block)
+    def self.use_ssl?(uri)
+      uri.scheme == 'https'
+    end
+
+    def self.issue_http_request(request, uri, retry_limit, logger, options, &block)
       rich_uri = URI(uri)
-      options = opts.merge(use_ssl: DownloadCache.use_ssl?(rich_uri))
       Net::HTTP.start(rich_uri.host, rich_uri.port, options) do |http|
-        request = Net::HTTP::Get.new(uri)
-        return retry_http_request(http, request, retry_limit, logger, &block)
+        retry_http_request(http, request, retry_limit, logger, &block)
       end
     end
 
@@ -171,23 +211,47 @@ module JavaBuildpack::Util
       1.upto(retry_limit) do |try|
         begin
           http.request request do |response|
-            if response.code == HTTP_OK || try == retry_limit
-              return yield response
+            response_code = response.code
+            if response_code == HTTP_OK || response_code == HTTP_NOT_MODIFIED
+              yield response
+            else
+              logger.debug { "HTTP request attempt #{try} of #{retry_limit} failed: #{response_code}" }
+              if try == retry_limit
+                @@monitor.synchronize do
+                  if @@internet_checked
+                    raise "HTTP request failed with bad response code: #{response_code}"
+                  else
+                    store_internet_availability false
+                    yield response
+                  end
+                end
+              end
             end
           end
         rescue *HTTP_ERRORS => ex
-          logger.debug { "HTTP get attempt #{try} of #{retry_limit} failed: #{ex}" }
-          raise ex if try == retry_limit
+          logger.debug { "HTTP request attempt #{try} of #{retry_limit} failed: #{ex}" }
+          if try == retry_limit
+            @@monitor.synchronize do
+              if @@internet_checked
+                raise ex
+              else
+                store_internet_availability false
+                yield ExceptionResponse.new(ex)
+              end
+            end
+          end
         end
       end
     end
 
-    def should_update(locked_file_cache)
-      locked_file_cache.cached? && (locked_file_cache.has_etag? || locked_file_cache.has_last_modified?)
-    end
+    class ExceptionResponse
+      def initialize(exception)
+        @exception = exception
+      end
 
-    def should_download(locked_file_cache)
-      !locked_file_cache.cached?
+      def code
+        @exception.to_s
+      end
     end
 
     def self.store_internet_availability(internet_up)
@@ -204,31 +268,47 @@ module JavaBuildpack::Util
       end
     end
 
-    def download(file_cache, uri, internet_up)
-      if internet_up
-        begin
-          DownloadCache.http_get(uri, DOWNLOAD_RETRY_LIMIT, @logger) do |response|
-            DownloadCache.write_response(file_cache, response)
+    def download(uri, mutable_file_cache)
+      if DownloadCache.use_internet?
+
+        request = Net::HTTP::Get.new(uri)
+        options = DownloadCache.http_options uri
+        retry_limit = DownloadCache.retry_limit
+
+        DownloadCache.issue_http_request(request, uri, retry_limit, @logger, options) do |response|
+          response_code = response.code
+          if response_code == HTTP_OK
+            DownloadCache.write_response(mutable_file_cache, response)
+          else
+            # Shouldn't get 304 on a true download attempt
+            fail "Unexpected HTTP response code: #{response_code}"
           end
-        rescue *HTTP_ERRORS => ex
-          puts 'FAIL'
-          error_message = "Unable to download from #{uri} due to #{ex}"
-          raise error_message
         end
       else
-        look_aside(file_cache, uri)
+        look_aside(uri, mutable_file_cache)
+      end
+    end
+
+    def self.write_response(mutable_file_cache, response)
+      mutable_file_cache.persist_any_etag response['Etag']
+      mutable_file_cache.persist_any_last_modified response['Last-Modified']
+
+      mutable_file_cache.persist_data do |cached_file|
+        response.read_body do |chunk|
+          cached_file.write(chunk)
+        end
       end
     end
 
     # A download has failed, so check the read-only buildpack cache for the file
     # and use the copy there if it exists.
-    def look_aside(file_cache, uri)
+    def look_aside(uri, mutable_file_cache)
       @logger.debug "Unable to download from #{uri}. Looking in buildpack cache."
       key = URI.escape(uri, '/')
       stashed = File.join(ENV['BUILDPACK_CACHE'], 'java-buildpack', "#{key}.cached")
       @logger.debug { "Looking in buildpack cache for file '#{stashed}'" }
       if File.exist? stashed
-        file_cache.persist_file stashed
+        mutable_file_cache.persist_file stashed
         @logger.debug "Using copy of #{uri} from buildpack cache."
       else
         message = "Buildpack cache does not contain #{uri}. Failing the download."
@@ -238,44 +318,5 @@ module JavaBuildpack::Util
       end
     end
 
-    def update(file_cache, uri)
-      rich_uri = URI(uri)
-
-      Net::HTTP.start(rich_uri.host, rich_uri.port, use_ssl: DownloadCache.use_ssl?(rich_uri)) do |http|
-        request = Net::HTTP::Get.new(uri)
-
-        file_cache.any_etag do |etag_content|
-          request['If-None-Match'] = etag_content
-        end
-
-        file_cache.any_last_modified do |last_modified_content|
-          request['If-Modified-Since'] = last_modified_content
-        end
-
-        http.request request do |response|
-          DownloadCache.write_response(file_cache, response) unless response.code == '304'
-        end
-      end
-
-    rescue *HTTP_ERRORS => ex
-      @logger.warn "Unable to update from #{uri} due to #{ex}. Using cached version."
-    end
-
-    def self.use_ssl?(uri)
-      uri.scheme == 'https'
-    end
-
-    def self.write_response(file_cache, response)
-      file_cache.persist_any_etag response['Etag']
-      file_cache.persist_any_last_modified response['Last-Modified']
-
-      file_cache.persist_data do |cached_file|
-        response.read_body do |chunk|
-          cached_file.write(chunk)
-        end
-      end
-    end
-
   end
-
 end

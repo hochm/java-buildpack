@@ -39,40 +39,40 @@ module JavaBuildpack::Util
       cached = File.join(@cache_root, "#{key}.cached")
       etag = File.join(@cache_root, "#{key}.etag")
       last_modified = File.join(@cache_root, "#{key}.last_modified")
-
-      File.open(@lock, File::CREAT) do |lock_file|
-        lock_file.flock(File::LOCK_EX)
-        @locked_file_cache = LockedFileCache.new(cached, etag, last_modified)
-        lock_file.flock(File::LOCK_SH)
-      end
-
+      @immutable_file_cache = ImmutableFileCache.new(cached, etag, last_modified)
+      @mutable_file_cache = MutableFileCache.new(cached, etag, last_modified)
     end
 
-    # Perform an operation with the file cache locked.
+    # Perform an operation with the file cache locked exclusively. Mutations of the file cache are permitted.
     #
     # @yieldparam [LockedFileCache] @locked_file_cache an object which the provided block may use to operate on the file cache under the lock
-    def lock
+    def lock_exclusive
       File.open(@lock, File::CREAT) do |lock_file|
         lock_file.flock(File::LOCK_EX)
-        @locked_file_cache.lock_file = lock_file
-        begin
-          yield @locked_file_cache
-        ensure
-          @locked_file_cache.lock_file = nil
-        end
+        yield @mutable_file_cache
+      end
+    end
+
+    # Perform an operation with the file cache locked shared. Mutations of the file cache are not permitted.
+    #
+    # @yieldparam [LockedFileCache] @locked_file_cache an object which the provided block may use to operate on the file cache under the lock
+    def lock_shared
+      File.open(@lock, File::CREAT) do |lock_file|
+        lock_file.flock(File::LOCK_SH)
+        yield @immutable_file_cache
       end
     end
 
     # Destroys the file cache.
     def destroy
-      lock do |locked_file_cache|
+      lock_exclusive do |locked_file_cache|
         locked_file_cache.destroy
       end
-      LockedFileCache.delete_file @lock
+      MutableFileCache.delete_file @lock
     end
 
     # This class is used to operate on the file cache under the lock.
-    class LockedFileCache
+    class ImmutableFileCache
 
       # Creates an instance of +LockedFileCache+.
       #
@@ -83,37 +83,6 @@ module JavaBuildpack::Util
         @cached = cached
         @etag = etag
         @last_modified = last_modified
-      end
-
-      # Sets the open lock file so that it can be downgraded and upgraded.
-      attr_writer :lock_file
-
-      # If an etag is provided, stores it in the corresponding file.
-      #
-      # @param [String, nil] etag_data the etag or +nil+ if there is no etag
-      def persist_any_etag(etag_data)
-        persist(etag_data, @etag)
-      end
-
-      # If a last modified timestamp is provided, stores it in the corresponding file.
-      #
-      # @param [String, nil] last_modified_data the last modified timestamp or +nil+ if there is no last modified timestamp
-      def persist_any_last_modified(last_modified_data)
-        persist(last_modified_data, @last_modified)
-      end
-
-      # Stores data to be cached.
-      def persist_data
-        File.open(@cached, File::CREAT | File::WRONLY) do |cached_file|
-          yield cached_file
-        end
-      end
-
-      # Stores data to be cached from a file.
-      #
-      # @param [String] file the file name of the file whose content is to be cached
-      def persist_file(file)
-        FileUtils.cp(file, @cached)
       end
 
       # Returns whether or not data is cached.
@@ -147,24 +116,11 @@ module JavaBuildpack::Util
         yield_file_data(@last_modified, &block)
       end
 
-      # Downgrades the lock from exclusive to shared, yields an open file containing the cached data, then upgrades
-      # the lock from shared to exclusive to preserve the +LockedFileCache+ contract.
+      # Yields an open file containing the cached data.
       def data
-        @lock_file.flock(File::LOCK_SH)
-        begin
-          File.open(@cached, File::RDONLY) do |cached_file|
-            yield cached_file
-          end
-        ensure
-          @lock_file.flock(File::LOCK_EX) # FIXME: finally
+        File.open(@cached, File::RDONLY) do |cached_file|
+          yield cached_file
         end
-      end
-
-      # Deletes any files containing cached data, etag, or last modified timestamp.
-      def destroy
-        LockedFileCache.delete_file @cached
-        LockedFileCache.delete_file @etag
-        LockedFileCache.delete_file @last_modified
       end
 
       private
@@ -185,6 +141,55 @@ module JavaBuildpack::Util
           end
         end
       end
+
+    end
+
+    class MutableFileCache < ImmutableFileCache
+      # Creates an instance of +MutableFileCache+.
+      #
+      # @param [String] cached file name of the file to contain the cached data
+      # @param [String] etag file name of the file to contain any etag
+      # @param [String] last_modified file name of the file to contain any last modified timestamp
+      def initialize(cached, etag, last_modified)
+        super
+      end
+
+      # If an etag is provided, stores it in the corresponding file.
+      #
+      # @param [String, nil] etag_data the etag or +nil+ if there is no etag
+      def persist_any_etag(etag_data)
+        persist(etag_data, @etag)
+      end
+
+      # If a last modified timestamp is provided, stores it in the corresponding file.
+      #
+      # @param [String, nil] last_modified_data the last modified timestamp or +nil+ if there is no last modified timestamp
+      def persist_any_last_modified(last_modified_data)
+        persist(last_modified_data, @last_modified)
+      end
+
+      # Stores data to be cached.
+      def persist_data
+        File.open(@cached, File::CREAT | File::WRONLY) do |cached_file|
+          yield cached_file
+        end
+      end
+
+      # @param [String] file the file name of the file whose content is to be cached
+      def persist_file(file)
+        FileUtils.cp(file, @cached)
+      end
+
+      # Stores data to be cached from a file.
+      #
+      # Deletes any files containing cached data, etag, or last modified timestamp.
+      def destroy
+        MutableFileCache.delete_file @cached
+        MutableFileCache.delete_file @etag
+        MutableFileCache.delete_file @last_modified
+      end
+
+      private
 
       def self.delete_file(filename)
         File.delete filename if File.exists? filename
