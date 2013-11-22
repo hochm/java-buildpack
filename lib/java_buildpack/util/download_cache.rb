@@ -28,12 +28,14 @@ module JavaBuildpack::Util
 
   # A cache for downloaded files that is configured to use a filesystem as the backing store. This cache uses standard
   # file locking (<tt>File.flock()</tt>) in order ensure that mutation of files in the cache is non-concurrent across
-  # processes.  Reading downloaded files happens concurrently so read performance is not impacted.
+  # processes. Reading downloaded files happens concurrently so read performance is not impacted.
+  #
+  # This class is not thread safe. File locking does not serialise threads in a single process.
   #
   # References:
   # * {https://en.wikipedia.org/wiki/HTTP_ETag ETag Wikipedia Definition}
   # * {http://www.w3.org/Protocols/rfc2616/rfc2616-sec14.html HTTP/1.1 Header Field Definitions}
-  class DownloadCache
+  class DownloadCache # rubocop:disable ClassLength
 
     # Creates an instance of the cache that is backed by the filesystem rooted at +cache_root+
     #
@@ -43,24 +45,17 @@ module JavaBuildpack::Util
       @logger = JavaBuildpack::Diagnostics::LoggerFactory.get_logger
     end
 
-    # Retrieves an item from the cache. The algorithm is as follows:
+    # Retrieves an item from the cache. Yields an open file containing the item's content or raises an exception if
+    # the item cannot be retrieved.
     #
-    # 1. Attempt to retrieve the item from the cache under a shared lock. This includes issuing a HTTP GET request
-    #    to see if the item is up to date. If the item was up to date in the cache, it is yielded. If the item was
-    #    not present in the cache and was not downloaded, an exception is raised.
-    # 2. If the item was not retrieved or was not up to date, obtain an up to date copy under an exclusive lock and
-    #    store it in the cache. If this fails, raise an exception.
-    # 3. Repeat the process until a file is successfully yielded or an exception is raised.
-    #
-    # @param [String] uri the uri to download if the item is not already in the cache.  Also used in the case where the
-    #                     item is already in the cache, to validate that the item is up to date
-    # @yieldparam [File] file the file representing the cached item. In order to ensure that the file is not changed or
+    # @param [String] uri the uri of the item
+    # @yieldparam [File] file_data the file representing the cached item. In order to ensure that the file is not changed or
     #                    deleted while it is being used, the cached item can only be accessed as part of a block.
     # @return [void]
     def get(uri)
-      file_cache = FileCache.new(@cache_root, uri)
+      file_cache = file_cache(uri)
 
-      success = false;
+      success = false
       until success
         success = file_cache.lock_shared do |immutable_file_cache|
           deliver(uri, immutable_file_cache) do |file_data|
@@ -78,10 +73,10 @@ module JavaBuildpack::Util
 
     # Remove an item from the cache
     #
-    # @param [String] uri the URI of the item to remove
+    # @param [String] uri the URI of the item
     # @return [void]
     def evict(uri)
-      FileCache.new(@cache_root, uri).destroy
+      file_cache(uri).destroy
     end
 
     private
@@ -124,21 +119,20 @@ module JavaBuildpack::Util
     @@internet_checked = false
     @@internet_up = true
 
+    def file_cache(uri)
+      FileCache.new(@cache_root, uri)
+    end
+
     def deliver(uri, immutable_file_cache)
       success = false
       if immutable_file_cache.cached? && !immutable_file_cache.has_etag? && !immutable_file_cache.has_last_modified?
         success = true
       elsif DownloadCache.use_internet?
-
         request = Net::HTTP::Head.new(uri)
         add_headers(request, immutable_file_cache)
-        options = DownloadCache.http_options uri
-        retry_limit = DownloadCache.retry_limit
 
-        DownloadCache.issue_http_request(request, uri, retry_limit, @logger, options) do |response|
-          if response.code == HTTP_NOT_MODIFIED
-            success = true
-          end
+        issue_http_request(request, uri) do |_, response_code|
+          success = true if response_code == HTTP_NOT_MODIFIED
         end
       end
       if success
@@ -188,69 +182,59 @@ module JavaBuildpack::Util
       YAML.load_file(expanded_path)
     end
 
-    def self.http_options(uri)
+    def self.http_options(rich_uri)
       options = {}
       @@monitor.synchronize do
+        # Beware known problems with timeouts: https://www.ruby-forum.com/topic/143840
         options = { read_timeout: TIMEOUT_SECONDS, connect_timeout: TIMEOUT_SECONDS, open_timeout: TIMEOUT_SECONDS } unless @@internet_checked
       end
-      options.merge(use_ssl: use_ssl?(URI(uri)))
+      options.merge(use_ssl: use_ssl?(rich_uri))
     end
 
-    def self.use_ssl?(uri)
-      uri.scheme == 'https'
+    def self.use_ssl?(rich_uri)
+      rich_uri.scheme == 'https'
     end
 
-    def self.issue_http_request(request, uri, retry_limit, logger, options, &block)
-      rich_uri = URI(uri)
-      Net::HTTP.start(rich_uri.host, rich_uri.port, options) do |http|
-        retry_http_request(http, request, retry_limit, logger, &block)
+    def issue_http_request(request, uri, &block)
+      Net::HTTP.start(*start_parameters(uri)) do |http|
+        retry_http_request(http, request, &block)
       end
     end
 
-    def self.retry_http_request(http, request, retry_limit, logger)
+    def start_parameters(uri)
+      rich_uri = URI(uri)
+      return rich_uri.host, rich_uri.port, DownloadCache.http_options(rich_uri) # rubocop:disable RedundantReturn
+    end
+
+    def retry_http_request(http, request, &block)
+      retry_limit = DownloadCache.retry_limit
       1.upto(retry_limit) do |try|
         begin
           http.request request do |response|
             response_code = response.code
             if response_code == HTTP_OK || response_code == HTTP_NOT_MODIFIED
-              yield response
+              yield response, response_code
             else
-              logger.debug { "HTTP request attempt #{try} of #{retry_limit} failed: #{response_code}" }
-              if try == retry_limit
-                @@monitor.synchronize do
-                  if @@internet_checked
-                    raise "HTTP request failed with bad response code: #{response_code}"
-                  else
-                    store_internet_availability false
-                    yield response
-                  end
-                end
-              end
+              fail "Bad HTTP response: #{response_code}"
             end
           end
-        rescue *HTTP_ERRORS => ex
-          logger.debug { "HTTP request attempt #{try} of #{retry_limit} failed: #{ex}" }
-          if try == retry_limit
-            @@monitor.synchronize do
-              if @@internet_checked
-                raise ex
-              else
-                store_internet_availability false
-                yield ExceptionResponse.new(ex)
-              end
-            end
-          end
+        rescue String, *HTTP_ERRORS => ex
+          handle_failure(ex, try, retry_limit, &block)
         end
       end
     end
 
-    class ExceptionResponse
-      def initialize(exception)
-        @exception = exception
-      end
-
-      def code
-        @exception.to_s
+    def handle_failure(exception, try, retry_limit)
+      @logger.debug { "HTTP request attempt #{try} of #{retry_limit} failed: #{exception.message}" }
+      if try == retry_limit
+        @@monitor.synchronize do
+          if @@internet_checked
+            fail exception
+          else
+            DownloadCache.store_internet_availability false
+            yield exception, exception.message
+          end
+        end
       end
     end
 
@@ -270,13 +254,9 @@ module JavaBuildpack::Util
 
     def download(uri, mutable_file_cache)
       if DownloadCache.use_internet?
-
         request = Net::HTTP::Get.new(uri)
-        options = DownloadCache.http_options uri
-        retry_limit = DownloadCache.retry_limit
 
-        DownloadCache.issue_http_request(request, uri, retry_limit, @logger, options) do |response|
-          response_code = response.code
+        issue_http_request(request, uri) do |response, response_code|
           if response_code == HTTP_OK
             DownloadCache.write_response(mutable_file_cache, response)
           else

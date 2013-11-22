@@ -71,7 +71,7 @@ module JavaBuildpack::Util
       MutableFileCache.delete_file @lock
     end
 
-    # This class is used to operate on the file cache under the lock.
+    # This class is used to read the file cache under a shared lock.
     class ImmutableFileCache
 
       # Creates an instance of +LockedFileCache+.
@@ -144,6 +144,7 @@ module JavaBuildpack::Util
 
     end
 
+    # This class is used to read or update the file cache under an exclusive lock.
     class MutableFileCache < ImmutableFileCache
       # Creates an instance of +MutableFileCache+.
       #
