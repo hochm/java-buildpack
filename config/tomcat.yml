@@ -16,7 +16,7 @@
 # Configuration for the Tomcat container
 ---
 version: 7.0.+
-repository_root: "https://s3.amazonaws.com/hochm-buildpack-tomcat"
+repository_root: "http://s3.amazonaws.com/hochm-buildpack-tomcat"
 
 support:
   version: 1.1.+
